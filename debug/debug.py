@@ -1,0 +1,192 @@
+from classes import Response, STATError, DebugModule, BaseModule
+from shared import rest
+import os, sys, json, base64
+import datetime as dt
+
+def debug_module (req_body):
+
+    #Inputs Test, Params
+
+    if os.getenv('DEBUG_MODE') != "1":
+        raise STATError('DEBUG_MODE environment variable must be set to 1 to run this module')
+
+    debug_out = DebugModule(req_body)
+
+    match debug_out.Test.lower():
+        case 'token':
+            default_debug(debug_out)
+            token_debug(debug_out)
+        case 'rest':
+            default_debug(debug_out)
+            rest_debug(debug_out)
+        case 'rbac':
+            default_debug(debug_out)
+            token_debug(debug_out)
+            rbac_debug(debug_out)
+        case 'comment':
+            default_debug(debug_out)
+            comment_debug(debug_out)
+        case 'tag':
+            default_debug(debug_out)
+            tag_debug(debug_out)
+        case 'task':
+            default_debug(debug_out)
+            task_debug(debug_out)
+        case 'exception':
+            exception_debug(debug_out)
+        case _:
+            default_debug(debug_out)
+
+    return Response(debug_out)
+
+def default_debug(debug_out:DebugModule):
+    debug_out.GraphEndpoint = os.getenv('GRAPH_ENDPOINT')
+    debug_out.ARMEndpoint = os.getenv('ARM_ENDPOINT')
+    debug_out.LAEndpoint = os.getenv('LOGANALYTICS_ENDPOINT')
+    debug_out.M365Endpoint = os.getenv('M365_ENDPOINT')
+    debug_out.MDEEndpoint = os.getenv('MDE_ENDPOINT')
+    debug_out.TenantId = os.getenv('AZURE_TENANT_ID')
+    debug_out.KVEndpoint = os.getenv('KEYVAULT_ENDPOINT')
+    debug_out.KVSecretName = os.getenv('KEYVAULT_SECRET_NAME')
+    debug_out.KVClientId = os.getenv('KEYVAULT_CLIENT_ID')
+    debug_out.PackageUrl = os.getenv('WEBSITE_RUN_FROM_PACKAGE')
+    debug_out.DateFormat = os.getenv('DATE_FORMAT')
+    debug_out.TZ = os.getenv('TIME_ZONE')
+    debug_out.PythonVersion = sys.version
+
+def token_debug(debug_out:DebugModule):
+    base_module = BaseModule()
+    base_module.MultiTenantConfig = debug_out.Params.get('MultiTenantConfig', {})
+    token_type = debug_out.Params.get('TokenType', 'msgraph')
+    token = rest.token_cache(base_module, token_type)
+
+    content = token.token.split('.')[1] + '=='
+    b64_decoded = base64.urlsafe_b64decode(content)
+    decoded_token = json.loads(b64_decoded) 
+
+    debug_out.Audience = decoded_token.get('aud')
+    debug_out.Issuer = decoded_token.get('iss')
+    debug_out.Expiration = dt.datetime.fromtimestamp(token.expires_on).isoformat()
+    debug_out.AppDisplayName = decoded_token.get('app_displayname')
+    debug_out.AppId = decoded_token.get('appid')
+    debug_out.ObjectId = decoded_token.get('oid')
+    debug_out.Idp = decoded_token.get('idp')
+    debug_out.AppRoles = decoded_token.get('roles')
+    debug_out.TenantId = decoded_token.get('tid')
+
+def rest_debug(debug_out:DebugModule):
+    base_module = BaseModule()
+    base_module.MultiTenantConfig = debug_out.Params.get('MultiTenantConfig', {})
+    token_type = debug_out.Params.get('TokenType', 'msgraph')
+    rest_call_method = debug_out.Params.get('Method').lower()
+    rest_call_path = debug_out.Params.get('Path')
+    rest_call_body = debug_out.Params.get('Body')
+
+    match rest_call_method:
+        case 'get':
+            response = rest.rest_call_get(base_module, token_type, rest_call_path)
+            parse_response(debug_out, response)
+        case 'put':
+            response = rest.rest_call_put(base_module, token_type, rest_call_path, rest_call_body)
+            parse_response(debug_out, response)
+        case 'post':
+            response = rest.rest_call_post(base_module, token_type, rest_call_path, rest_call_body)
+            parse_response(debug_out, response)
+        case _:
+            raise STATError(error=f'Invalid Method sent to debug module: {rest_call_method}.', status_code=400)
+        
+def rbac_debug(debug_out:DebugModule):
+    base_module = BaseModule()
+    base_module.MultiTenantConfig = debug_out.Params.get('MultiTenantConfig', {})
+    token_type = 'arm'
+    sub_id = debug_out.Params.get('SubscriptionId')
+    rg_name = debug_out.Params.get('RGName')
+    scope = f'/subscriptions/{sub_id}/resourceGroups/{rg_name}'
+    rbac_info = json.loads(rest.rest_call_get(base_module, token_type, f"{scope}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()+and+assignedTo('{debug_out.ObjectId}')").content)
+
+    debug_out.RBACAssignedRoles = []
+    debug_out.RBACAssignedRoleIds = []
+
+    for role in rbac_info.get('value'):
+        role_id = role['properties']['roleDefinitionId']
+        result = json.loads(rest.rest_call_get(base_module, token_type, f"{role_id}?api-version=2022-04-01").content)
+        debug_out.RBACAssignedRoles.append(result['properties']['roleName'])
+        debug_out.RBACAssignedRoleIds.append(result['name'])
+
+    expected_roles = [
+        'b24988ac-6180-42a0-ab88-20f7382dd24c', # Contributor
+        '8e3af657-a8ff-443c-a75c-2fe8c4bcb635', # Owner
+        'ab8e14d6-4a74-4a29-9ba8-549422addade', # Sentinel Contributor
+        '3e150937-b8fe-4cfb-8069-0eaf05ecd056' # Sentinel Responder
+        ]
+    
+    role_matched = any(item in expected_roles for item in debug_out.RBACAssignedRoleIds)
+    debug_out.RBACMessage = 'A required RBAC Role assignment was found.' if role_matched else 'No required RBAC Role assignment was found.'
+
+def exception_debug(debug_out:DebugModule):
+    exception_type = debug_out.Params.get('ExceptionType', 'STATError')
+    match exception_type:
+        case 'STATError':
+            raise STATError('STATError raised from debug module.')
+        case 'Exception':
+            raise Exception()
+        case 'BaseException':
+            raise BaseException()
+        case _:
+            raise STATError(error=f'Invalid exception type sent to debug module: {exception_type}.', status_code=400)
+        
+def parse_response(debug_out:DebugModule, response):
+    try:
+        debug_out.JSONContent = json.loads(response.content)
+    except:
+        debug_out.JSONContent = {'Status': 'Failed to load JSON content'}
+
+    debug_out.StatusCode = response.status_code
+    debug_out.Url = response.url
+    debug_out.TextContent = response.text
+
+def comment_debug(debug_out:DebugModule):
+    comment = debug_out.Params.get('Comment')
+    base_module = BaseModule()
+    base_module.MultiTenantConfig = debug_out.Params.get('MultiTenantConfig', {})
+    base_module.IncidentARMId = debug_out.Params['IncidentARMId']
+    base_module.IncidentAvailable = True
+    try: 
+        response = rest.add_incident_comment(base_module, comment, raise_on_error=True)
+        debug_out.CommentStatus = response.status_code
+        debug_out.CommentResponse = response.json()
+    except STATError as e:
+        debug_out.CommentStatus = 'Comment failed'
+        debug_out.CommentSourceError = e.source_error
+        debug_out.CommentStatusCode = e.status_code
+
+def task_debug(debug_out:DebugModule):
+    title = debug_out.Params.get('TaskTitle')
+    description = debug_out.Params.get('TaskDescription', '')
+    base_module = BaseModule()
+    base_module.MultiTenantConfig = debug_out.Params.get('MultiTenantConfig', {})
+    base_module.IncidentARMId = debug_out.Params['IncidentARMId']
+    base_module.IncidentAvailable = True
+    try: 
+        response = rest.add_incident_task(base_module, title, description, raise_on_error=True)
+        debug_out.TaskStatus = response.status_code
+        debug_out.TaskResponse = response.json()
+    except STATError as e:
+        debug_out.TaskStatus = 'Task failed'
+        debug_out.TaskSourceError = e.source_error
+        debug_out.TaskStatusCode = e.status_code
+
+def tag_debug(debug_out:DebugModule):
+    tag = [debug_out.Params.get('Tag')]
+    base_module = BaseModule()
+    base_module.MultiTenantConfig = debug_out.Params.get('MultiTenantConfig', {})
+    base_module.IncidentARMId = debug_out.Params['IncidentARMId']
+    base_module.IncidentAvailable = True
+    try: 
+        response = rest.add_incident_tags(base_module, tag, raise_on_error=True)
+        debug_out.TagStatus = response.status_code
+        debug_out.TagResponse = response.json()
+    except STATError as e:
+        debug_out.TagStatus = 'Tag failed'
+        debug_out.TagSourceError = e.source_error
+        debug_out.TagStatusCode = e.status_code
